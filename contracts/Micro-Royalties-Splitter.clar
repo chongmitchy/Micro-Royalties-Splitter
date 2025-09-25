@@ -10,12 +10,17 @@
 (define-constant ERR-ALREADY-EXISTS (err u106))
 (define-constant ERR-INVALID-AMOUNT (err u107))
 (define-constant ERR-NO-RECIPIENTS (err u108))
+(define-constant ERR-VESTING-NOT-STARTED (err u109))
+(define-constant ERR-VESTING-ALREADY-EXISTS (err u110))
+(define-constant ERR-INVALID-VESTING-PERIOD (err u111))
+(define-constant ERR-NO-VESTED-AMOUNT (err u112))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-percentage uint u0)
 (define-data-var total-distributed uint u0)
 (define-data-var total-received uint u0)
 (define-data-var recipient-count uint u0)
+(define-data-var next-vesting-id uint u1)
 
 (define-map recipients 
     principal 
@@ -30,6 +35,25 @@
 
 (define-map recipient-index uint principal)
 (define-map balances principal uint)
+
+(define-map vesting-schedules
+    uint
+    {
+        recipient: principal,
+        total-amount: uint,
+        vested-amount: uint,
+        start-block: uint,
+        cliff-period: uint,
+        vesting-period: uint,
+        last-claim-block: uint,
+        active: bool
+    }
+)
+
+(define-map recipient-vesting
+    principal
+    { vesting-id: uint }
+)
 
 (define-public (add-recipient (recipient principal) (percentage uint))
     (begin
@@ -159,19 +183,33 @@
 
 
 (define-public (withdraw)
-    (let ((balance (default-to u0 (map-get? balances tx-sender))))
-        (asserts! (> balance u0) ERR-INSUFFICIENT-BALANCE)
+    (let ((immediate-balance (default-to u0 (map-get? balances tx-sender)))
+          (vested-amount (calculate-vested-amount tx-sender)))
+        (asserts! (or (> immediate-balance u0) (> vested-amount u0)) ERR-INSUFFICIENT-BALANCE)
         
-        (map-delete balances tx-sender)
-        (match (map-get? recipients tx-sender)
-            recipient-data (map-set recipients tx-sender 
-                (merge recipient-data { 
-                    withdrawn: (+ (get withdrawn recipient-data) balance) 
-                }))
-            true
+        (let ((total-withdrawal (+ immediate-balance vested-amount)))
+            (begin
+                (if (> immediate-balance u0)
+                    (map-delete balances tx-sender)
+                    true)
+                
+                (if (> vested-amount u0)
+                    (begin
+                        (unwrap-panic (claim-vested-tokens tx-sender))
+                        true)
+                    true)
+                
+                (match (map-get? recipients tx-sender)
+                    recipient-data (map-set recipients tx-sender 
+                        (merge recipient-data { 
+                            withdrawn: (+ (get withdrawn recipient-data) total-withdrawal) 
+                        }))
+                    true
+                )
+                
+                (as-contract (stx-transfer? total-withdrawal tx-sender tx-sender))
+            )
         )
-        
-        (as-contract (stx-transfer? balance tx-sender tx-sender))
     )
 )
 
@@ -201,6 +239,120 @@
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
         (var-set contract-owner new-owner)
         (ok true)
+    )
+)
+
+(define-public (create-vesting-schedule 
+    (recipient principal)
+    (total-amount uint)
+    (cliff-period uint)
+    (vesting-period uint))
+    (let ((vesting-id (var-get next-vesting-id)))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+        (asserts! (> total-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> vesting-period u0) ERR-INVALID-VESTING-PERIOD)
+        (asserts! (>= vesting-period cliff-period) ERR-INVALID-VESTING-PERIOD)
+        (asserts! (is-none (map-get? recipient-vesting recipient)) ERR-VESTING-ALREADY-EXISTS)
+        
+        (map-set vesting-schedules vesting-id {
+            recipient: recipient,
+            total-amount: total-amount,
+            vested-amount: u0,
+            start-block: stacks-block-height,
+            cliff-period: cliff-period,
+            vesting-period: vesting-period,
+            last-claim-block: stacks-block-height,
+            active: true
+        })
+        
+        (map-set recipient-vesting recipient { vesting-id: vesting-id })
+        
+        (var-set next-vesting-id (+ vesting-id u1))
+        (ok vesting-id)
+    )
+)
+
+(define-public (claim-vested-tokens (recipient principal))
+    (let ((vesting-info (unwrap! (map-get? recipient-vesting recipient) ERR-NOT-FOUND))
+          (vesting-id (get vesting-id vesting-info)))
+        (match (map-get? vesting-schedules vesting-id)
+            schedule
+                (let ((available-amount (calculate-vested-amount recipient)))
+                    (asserts! (> available-amount u0) ERR-NO-VESTED-AMOUNT)
+                    (asserts! (get active schedule) ERR-VESTING-NOT-STARTED)
+                    
+                    (map-set vesting-schedules vesting-id
+                        (merge schedule {
+                            vested-amount: (+ (get vested-amount schedule) available-amount),
+                            last-claim-block: stacks-block-height
+                        })
+                    )
+                    
+                    (ok available-amount)
+                )
+            ERR-NOT-FOUND
+        )
+    )
+)
+
+(define-private (calculate-vested-amount (recipient principal))
+    (match (map-get? recipient-vesting recipient)
+        vesting-info
+            (let ((vesting-id (get vesting-id vesting-info)))
+                (match (map-get? vesting-schedules vesting-id)
+                    schedule
+                        (if (get active schedule)
+                            (let ((current-block stacks-block-height)
+                                  (start-block (get start-block schedule))
+                                  (cliff-period (get cliff-period schedule))
+                                  (vesting-period (get vesting-period schedule))
+                                  (total-amount (get total-amount schedule))
+                                  (already-vested (get vested-amount schedule))
+                                  (elapsed-blocks (- current-block start-block)))
+                                
+                                (if (< elapsed-blocks cliff-period)
+                                    u0
+                                    (if (>= elapsed-blocks vesting-period)
+                                        (- total-amount already-vested)
+                                        (let ((vested-total (/ (* total-amount elapsed-blocks) vesting-period)))
+                                            (if (> vested-total already-vested)
+                                                (- vested-total already-vested)
+                                                u0
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                            u0
+                        )
+                    u0
+                )
+            )
+        u0
+    )
+)
+
+(define-public (deposit-to-vesting (recipient principal) (amount uint))
+    (let ((vesting-info (unwrap! (map-get? recipient-vesting recipient) ERR-NOT-FOUND))
+          (vesting-id (get vesting-id vesting-info)))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (match (map-get? vesting-schedules vesting-id)
+            schedule
+                (begin
+                    (map-set vesting-schedules vesting-id
+                        (merge schedule {
+                            total-amount: (+ (get total-amount schedule) amount)
+                        })
+                    )
+                    (var-set total-received (+ (var-get total-received) amount))
+                    (ok amount)
+                )
+            ERR-NOT-FOUND
+        )
     )
 )
 
@@ -250,4 +402,12 @@
 
 (define-read-only (calculate-share (amount uint) (percentage uint))
     (/ (* amount percentage) u100)
+)
+
+(define-read-only (get-vesting-schedule (vesting-id uint))
+    (map-get? vesting-schedules vesting-id)
+)
+
+(define-read-only (get-recipient-vesting (recipient principal))
+    (map-get? recipient-vesting recipient)
 )
