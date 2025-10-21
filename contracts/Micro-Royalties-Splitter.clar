@@ -14,6 +14,8 @@
 (define-constant ERR-VESTING-ALREADY-EXISTS (err u110))
 (define-constant ERR-INVALID-VESTING-PERIOD (err u111))
 (define-constant ERR-NO-VESTED-AMOUNT (err u112))
+(define-constant ERR-INVALID-SNAPSHOT-ID (err u113))
+(define-constant ERR-NO-DISTRIBUTIONS (err u114))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-percentage uint u0)
@@ -21,6 +23,7 @@
 (define-data-var total-received uint u0)
 (define-data-var recipient-count uint u0)
 (define-data-var next-vesting-id uint u1)
+(define-data-var next-distribution-id uint u1)
 
 (define-map recipients 
     principal 
@@ -53,6 +56,30 @@
 (define-map recipient-vesting
     principal
     { vesting-id: uint }
+)
+
+(define-map distribution-history
+    uint
+    {
+        total-amount: uint,
+        timestamp: uint,
+        block-height: uint,
+        recipient-count: uint,
+        distributed-by: principal
+    }
+)
+
+(define-map distribution-recipients
+    { distribution-id: uint, recipient: principal }
+    {
+        amount: uint,
+        percentage: uint
+    }
+)
+
+(define-map recipient-distributions
+    principal
+    { distribution-ids: (list 100 uint) }
 )
 
 (define-public (add-recipient (recipient principal) (percentage uint))
@@ -130,14 +157,17 @@
 )
 
 (define-public (deposit-amount (amount uint))
-    (begin
+    (let ((distribution-id (var-get next-distribution-id)))
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
         (asserts! (> (var-get total-percentage) u0) ERR-NO-RECIPIENTS)
         
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (unwrap-panic (distribute-payment amount))
+        (unwrap-panic (record-distribution distribution-id amount))
+        
         (var-set total-received (+ (var-get total-received) amount))
-        (ok amount)
+        (var-set next-distribution-id (+ distribution-id u1))
+        (ok distribution-id)
     )
 )
 
@@ -172,6 +202,7 @@
                         total-earned: (+ (get total-earned recipient-data) share) 
                     }))
                 (var-set total-distributed (+ (var-get total-distributed) share))
+                (unwrap-panic (record-recipient-share recipient (var-get next-distribution-id) share percentage))
                 (ok true)
             )
             (ok true)
@@ -410,4 +441,84 @@
 
 (define-read-only (get-recipient-vesting (recipient principal))
     (map-get? recipient-vesting recipient)
+)
+
+(define-private (record-distribution (distribution-id uint) (amount uint))
+    (begin
+        (map-set distribution-history distribution-id {
+            total-amount: amount,
+            timestamp: stacks-block-height,
+            block-height: stacks-block-height,
+            recipient-count: (var-get recipient-count),
+            distributed-by: tx-sender
+        })
+        (ok true)
+    )
+)
+
+(define-private (record-recipient-share (recipient principal) (distribution-id uint) (amount uint) (percentage uint))
+    (let ((current-distributions (default-to { distribution-ids: (list) } 
+                                              (map-get? recipient-distributions recipient)))
+          (current-ids (get distribution-ids current-distributions)))
+        
+        (map-set distribution-recipients 
+            { distribution-id: distribution-id, recipient: recipient }
+            { amount: amount, percentage: percentage }
+        )
+        
+        (map-set recipient-distributions recipient {
+            distribution-ids: (unwrap-panic (as-max-len? (append current-ids distribution-id) u100))
+        })
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-distribution-info (distribution-id uint))
+    (map-get? distribution-history distribution-id)
+)
+
+(define-read-only (get-recipient-share (distribution-id uint) (recipient principal))
+    (map-get? distribution-recipients { distribution-id: distribution-id, recipient: recipient })
+)
+
+(define-read-only (get-recipient-distribution-history (recipient principal))
+    (map-get? recipient-distributions recipient)
+)
+
+(define-read-only (get-total-distributions)
+    (- (var-get next-distribution-id) u1)
+)
+
+(define-read-only (get-recipient-distribution-summary (recipient principal))
+    (match (map-get? recipients recipient)
+        recipient-data
+            (ok {
+                total-earned: (get total-earned recipient-data),
+                withdrawn: (get withdrawn recipient-data),
+                pending: (default-to u0 (map-get? balances recipient)),
+                active: (get active recipient-data),
+                percentage: (get percentage recipient-data),
+                distribution-count: (len (get distribution-ids 
+                    (default-to { distribution-ids: (list) } 
+                                (map-get? recipient-distributions recipient))))
+            })
+        ERR-NOT-FOUND
+    )
+)
+
+(define-read-only (get-distribution-snapshot (distribution-id uint) (recipients-list (list 5 principal)))
+    (let ((dist-info (unwrap! (map-get? distribution-history distribution-id) ERR-INVALID-SNAPSHOT-ID)))
+        (ok {
+            distribution-info: dist-info,
+            recipient-shares: (map get-recipient-share-for-snapshot recipients-list)
+        })
+    )
+)
+
+(define-private (get-recipient-share-for-snapshot (recipient principal))
+    (default-to 
+        { amount: u0, percentage: u0 }
+        (map-get? distribution-recipients { distribution-id: (var-get next-distribution-id), recipient: recipient })
+    )
 )
